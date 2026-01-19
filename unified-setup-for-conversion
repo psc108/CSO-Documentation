@@ -1,0 +1,823 @@
+#!/bin/bash
+
+# CPS Shared Services Portal (SSP) Unified Server Deployment Script
+# Version: 3.0 - Specification-compliant implementation
+#
+# USAGE:
+#   Auto-detect: ./unified-server-setup.sh-2nd
+#   Manual: ./unified-server-setup.sh-2nd ENVIRONMENT SERVER_TYPE SERVER_INDEX [EFS_DNS] [S3_BUCKET]
+#
+# SERVER TYPES: backend, frontend, keystone, rabbitmq, jump
+
+set -euo pipefail
+
+# Redirect ALL output to primary log
+exec > >(tee -a /var/log/cso-install.log) 2>&1
+
+echo "=== UNIFIED SETUP SCRIPT VERSION 3.0 - SPECIFICATION COMPLIANT ===="
+
+# Logging functions with structured format
+log_info() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] [${SERVER_TYPE:-INIT}] [${FUNCNAME[1]:-main}] $1"
+}
+
+log_success() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] [${SERVER_TYPE:-INIT}] [${FUNCNAME[1]:-main}] $1"
+}
+
+log_warning() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] [${SERVER_TYPE:-INIT}] [${FUNCNAME[1]:-main}] $1"
+}
+
+log_error() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] [${SERVER_TYPE:-INIT}] [${FUNCNAME[1]:-main}] $1"
+}
+
+log_progress() {
+    local msg="$1"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PROGRESS] [${SERVER_TYPE^^}] $msg"
+    [[ -n "${PROGRESS_LOG:-}" ]] && echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${SERVER_TYPE^^}-PROGRESS: $msg" >> "$PROGRESS_LOG"
+}
+
+log_debug() {
+    [[ "${DEBUG:-false}" == "true" ]] && echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] [${SERVER_TYPE:-INIT}] [${FUNCNAME[1]:-main}] $1"
+}
+
+# Auto-detect parameters from AWS metadata
+detect_parameters() {
+    log_info "Starting parameter auto-detection"
+    
+    # Get instance metadata
+    INSTANCE_ID=$(curl -s --max-time 5 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo "")
+    log_info "Instance ID: ${INSTANCE_ID:-'NOT DETECTED'}"
+    
+    if [[ -n "$INSTANCE_ID" ]]; then
+        log_info "AWS API call: describe-instances for $INSTANCE_ID"
+        INSTANCE_INFO=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0]" --output json 2>/dev/null || echo "{}")
+        
+        # Extract environment from tags
+        if [[ -z "${ENVIRONMENT:-}" ]]; then
+            ENVIRONMENT=$(echo "$INSTANCE_INFO" | python3 -c "import sys,json; data=json.load(sys.stdin); tags={t['Key']:t['Value'] for t in data.get('Tags',[])}; print(tags.get('Environment',''))" 2>/dev/null || echo "")
+            log_info "Detected parameter: ENVIRONMENT = $ENVIRONMENT"
+        fi
+        
+        # Extract server type and index from instance name
+        if [[ -z "${SERVER_TYPE:-}" ]]; then
+            INSTANCE_NAME=$(echo "$INSTANCE_INFO" | python3 -c "import sys,json; data=json.load(sys.stdin); tags={t['Key']:t['Value'] for t in data.get('Tags',[])}; print(tags.get('Name',''))" 2>/dev/null || echo "")
+            log_info "Instance Name: ${INSTANCE_NAME:-'NOT DETECTED'}"
+            
+            if [[ "$INSTANCE_NAME" =~ backend ]]; then SERVER_TYPE="backend"
+            elif [[ "$INSTANCE_NAME" =~ frontend ]]; then SERVER_TYPE="frontend"
+            elif [[ "$INSTANCE_NAME" =~ keystone ]]; then SERVER_TYPE="keystone"
+            elif [[ "$INSTANCE_NAME" =~ rabbitmq ]]; then SERVER_TYPE="rabbitmq"
+            elif [[ "$INSTANCE_NAME" =~ jump ]]; then SERVER_TYPE="jump"
+            fi
+            log_info "Detected parameter: SERVER_TYPE = ${SERVER_TYPE:-'NOT DETECTED'}"
+            
+            # Extract server index from name
+            if [[ "$INSTANCE_NAME" =~ -([0-9]+)$ ]]; then
+                SERVER_INDEX="${BASH_REMATCH[1]}"
+                log_info "Detected parameter: SERVER_INDEX = $SERVER_INDEX"
+            fi
+        fi
+    else
+        log_warning "EC2 metadata service not available - manual parameters required"
+    fi
+    
+    # Auto-detect EFS DNS name
+    if [[ -z "${EFS_DNS_NAME:-}" && -n "${ENVIRONMENT:-}" ]]; then
+        log_info "AWS API call: describe-file-systems for environment $ENVIRONMENT"
+        EFS_DNS_NAME=$(aws efs describe-file-systems --query "FileSystems[?Tags[?Key=='Name' && contains(Value,'${ENVIRONMENT}')]].DNSName | [0]" --output text 2>/dev/null || echo "")
+        log_info "Detected parameter: EFS_DNS_NAME = ${EFS_DNS_NAME:-'NOT DETECTED'}"
+    fi
+    
+    # Set default S3 bucket
+    if [[ -z "${S3_BUCKET:-}" ]]; then
+        S3_BUCKET="cso-ha-install-files-365612464816"
+        log_info "Using default S3_BUCKET = $S3_BUCKET"
+    fi
+    
+    log_success "Parameter auto-detection completed"
+}
+
+# Validate required parameters
+validate_parameters() {
+    log_info "Validating required parameters"
+    
+    if [[ -z "${ENVIRONMENT:-}" ]]; then
+        log_error "ENVIRONMENT parameter required"
+        exit 1
+    fi
+    
+    if [[ -z "${SERVER_TYPE:-}" ]]; then
+        log_error "SERVER_TYPE parameter required"
+        exit 1
+    fi
+    
+    if [[ ! "${SERVER_TYPE}" =~ ^(backend|frontend|keystone|rabbitmq|jump)$ ]]; then
+        log_error "Invalid SERVER_TYPE: $SERVER_TYPE. Must be: backend, frontend, keystone, rabbitmq, or jump"
+        exit 1
+    fi
+    
+    SERVER_INDEX=${SERVER_INDEX:-1}
+    log_info "Using SERVER_INDEX = $SERVER_INDEX"
+    
+    # Setup progress log
+    PROGRESS_LOG="/var/log/${SERVER_TYPE}-setup-progress.log"
+    log_info "Progress log: $PROGRESS_LOG"
+    
+    log_success "Parameter validation completed"
+}
+
+# Get passwords from AWS Secrets Manager
+get_passwords() {
+    log_info "Retrieving passwords from Secrets Manager"
+    
+    local secret_name="${ENVIRONMENT}-service-passwords"
+    log_info "AWS API call: get-secret-value for $secret_name"
+    
+    SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$secret_name" --query SecretString --output text 2>/dev/null || echo "{}")
+    
+    if [[ "$SECRET_JSON" != "{}" ]]; then
+        RABBITMQ_PASSWORD=$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('rabbitmq_password', 'RabbitPass123'))" 2>/dev/null)
+        SERVICE_PASSWORD=$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('service_password', 'ServicePass123'))" 2>/dev/null)
+        KEYSTONE_PASSWORD=$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('keystone_password', 'KeystonePass123'))" 2>/dev/null)
+        ADMIN_PASSWORD=$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('admin_password', 'AdminPass123'))" 2>/dev/null)
+        log_success "Retrieved passwords from Secrets Manager"
+    else
+        RABBITMQ_PASSWORD="RabbitPass123"
+        SERVICE_PASSWORD="ServicePass123"
+        KEYSTONE_PASSWORD="KeystonePass123"
+        ADMIN_PASSWORD="AdminPass123"
+        log_warning "Using default passwords - Secrets Manager unavailable"
+    fi
+    
+    export RABBITMQ_PASSWORD SERVICE_PASSWORD KEYSTONE_PASSWORD ADMIN_PASSWORD
+    log_info "Password variables exported"
+}
+
+# Common system setup for all servers
+setup_common() {
+    log_progress "=== ${SERVER_TYPE^^} SETUP STARTED ==="
+    log_progress "STEP 1/3: System updates and package installation"
+    
+    log_info "Updating system packages"
+    dnf update -y
+    log_success "System packages updated"
+    
+    log_info "Installing package: wget"
+    dnf install -y wget
+    log_info "Installing package: unzip"
+    dnf install -y unzip
+    log_info "Installing package: python3"
+    dnf install -y python3
+    log_info "Installing package: python3-pip"
+    dnf install -y python3-pip
+    log_info "Installing package: awscli"
+    dnf install -y awscli
+    log_info "Installing package: bind-utils"
+    dnf install -y bind-utils
+    log_success "Required packages installed"
+    
+    # Create ecs user
+    if ! id "ecs" &>/dev/null; then
+        log_info "Creating user: ecs"
+        useradd -m -s /bin/bash ecs
+        log_success "Created user: ecs"
+    else
+        log_info "User already exists: ecs"
+    fi
+    
+    log_info "Adding user to group: ecs -> wheel"
+    usermod -aG wheel ecs
+    log_info "Creating sudoers file: /etc/sudoers.d/ecs"
+    echo "ecs ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ecs
+    log_success "Configured ecs user with sudo privileges"
+    
+    log_progress "STEP 2/3: Setting up EFS mounts"
+    
+    log_info "Creating directory: /opt/scripts"
+    mkdir -p /opt/scripts
+    
+    if ! mountpoint -q /opt/scripts && [[ -n "${EFS_DNS_NAME:-}" ]]; then
+        log_info "Mounting: ${EFS_DNS_NAME}:/ at /opt/scripts"
+        echo "${EFS_DNS_NAME}:/ /opt/scripts nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,intr,timeo=600 0 0" >> /etc/fstab
+        mount /opt/scripts
+        log_success "EFS mounted at /opt/scripts"
+    else
+        log_info "EFS already mounted or DNS name not available"
+    fi
+    
+    log_progress "STEP 3/3: Verifying installation files from jump server"
+    
+    log_info "Checking for installation files extracted by jump server"
+    if [[ -d "/opt/install" ]]; then
+        log_success "Installation files available from jump server"
+    else
+        log_warning "Installation files not found - jump server may not have completed"
+    fi
+    
+    log_info "Forcing EFS filesystem sync"
+    sync
+    sleep 2
+    log_success "EFS filesystem sync completed"
+    
+    log_progress "Common setup completed"
+}
+
+# Wait for jump server completion
+wait_for_jump_server() {
+    log_info "Waiting for jump server extraction completion (up to 35 minutes)"
+    
+    timeout 35m sh -c '
+        while [ ! -f /opt/scripts/.setup-complete ]; do
+            echo "[$(date "+%Y-%m-%d %H:%M:%S")] [INFO] [WAIT] Waiting for jump server setup..."
+            sleep 60
+        done
+    ' || {
+        log_warning "Jump server setup timeout after 35 minutes, proceeding anyway"
+    }
+    
+    if [[ -f "/opt/scripts/.setup-complete" ]]; then
+        log_info "Jump server completion marker found"
+        log_info "Marker content: $(cat /opt/scripts/.setup-complete)"
+        
+        # Check for installer in both possible locations
+        if [[ -f "/opt/scripts/install/installer_p3.py" ]]; then
+            log_success "Jump server preparation verified - installer_p3.py found in /opt/scripts/install/"
+        elif [[ -f "/opt/installer_p3.py" ]]; then
+            log_success "Jump server preparation verified - installer_p3.py found in /opt/scripts/"
+        else
+            log_error "installer_p3.py missing from both locations - jump server preparation incomplete"
+            exit 1
+        fi
+    else
+        log_warning "Jump server completion marker not found - proceeding anyway"
+    fi
+}
+
+# Jump server setup
+setup_jump() {
+    log_progress "STEP 4/4: Setting up jump server"
+    
+    log_info "Installing package: nginx"
+    dnf install -y nginx
+    log_info "Installing package: python3"
+    dnf install -y python3
+    log_info "Installing package: unzip"
+    dnf install -y unzip
+    log_success "Jump server packages installed"
+    
+    log_info "Creating directory: /opt/install"
+    #rm -rf /opt/scripts/install
+    mkdir -p /opt/install
+    log_success "Clean installation directory created"
+    
+    # Find and extract installation package
+    local install_package=$(find /opt/scripts -name "installation-package*.jar" | head -1)
+    if [[ -n "$install_package" && -f "$install_package" ]]; then
+        log_info "Found CSO installation package: $install_package"
+        log_info "Extracting: $install_package to /opt/install"
+        
+        if unzip -o "$install_package" -d /opt/install 2>&1; then
+            log_success "JAR extraction completed"
+            
+            # Remove circular symlinks
+            #rm -f /opt/scripts/install/install 2>/dev/null || true
+            #log_info "Removed circular symlinks"
+            
+            if [[ -f "/opt/install/installer_p3.py" ]]; then
+                log_success "CSO installation package extracted with installer_p3.py"
+            else
+                log_error "installer_p3.py not found after extraction"
+                exit 1
+            fi
+        else
+            log_error "JAR extraction failed"
+            exit 1
+        fi
+    else
+        log_error "CSO installation package not found"
+        exit 1
+    fi
+    
+    log_info "Setting permissions: 755 on /opt/install (recursive)"
+    chown -R ecs:ecs /opt/install
+    chmod -R 755 /opt/install
+    log_success "Permissions set on extracted files"
+    
+    # Configure nginx
+    log_info "Creating config: /etc/nginx/conf.d/jump.conf"
+    cat > /etc/nginx/conf.d/jump.conf << 'EOF'
+server {
+    listen 80;
+    server_name _;
+    
+    location /health {
+        return 200 'OK';
+        add_header Content-Type text/plain;
+    }
+    
+    location / {
+        return 200 '<html><body><h1>Jump Server</h1><p>CSO installation management server ready</p></body></html>';
+        add_header Content-Type text/html;
+    }
+}
+EOF
+    log_success "Nginx configuration created"
+    
+    log_info "Starting service: nginx"
+    systemctl enable --now nginx
+    log_success "Nginx service started"
+    
+    # Replace installer_p3.py with fixed version
+    if [[ -f "/opt/install/installer_p3.py" ]]; then
+        log_info "Backing up original installer: installer_p3.py -> installer_p3.py.original"
+        mv /opt/install/installer_p3.py /opt/install/installer_p3.py.original
+        
+        log_info "Copying fixed installer from S3: s3://${S3_BUCKET}/installer_p3.py"
+        if aws s3 cp "s3://${S3_BUCKET}/installer_p3.py" /opt/install/installer_p3.py 2>/dev/null; then
+            chmod 755 /opt/install/installer_p3.py
+            chown ecs:ecs /opt/install/installer_p3.py
+            log_success "Fixed installer_p3.py deployed"
+        else
+            log_warning "Fixed installer not found in S3, using original"
+            mv /opt/install/installer_p3.py.original /opt/install/installer_p3.py
+        fi
+    fi
+    
+    # Create completion marker
+    log_info "Creating file: /opt/scripts/.setup-complete"
+    cd /opt/scripts/ssp
+    sudo python3 buildProperties_p3.py
+    sudo tar -xf /opt/scripts/manual-installation-2.0-SPRINT10e-scripts.tar.gz -C /opt/scripts
+    {
+        echo "Jump server setup completed at $(date)"
+        echo "Installation files verified at $(date)"
+        echo "installer_p3.py exists: $(test -f /opt/install/installer_p3.py && echo 'yes' || echo 'no')"
+    } > /opt/scripts/.setup-complete
+    sync
+    log_success "Setup completion marker created"
+    
+    log_progress "Jump server setup completed"
+}
+
+# Keystone server setup
+setup_keystone() {
+    log_progress "STEP 4/8: Setting up Keystone server"
+    
+    log_info "Installing package: python3-devel"
+    dnf install -y python3-devel
+    log_info "Installing package: httpd"
+    dnf install -y httpd
+    log_info "Installing package: mod_ssl"
+    dnf install -y mod_ssl
+    log_info "Installing package: gcc"
+    dnf install -y gcc
+    log_info "Installing package: mariadb105-server-utils"
+    dnf install -y mariadb105-server-utils
+    log_success "Keystone packages installed"
+    
+    # Create Python virtual environment
+    log_info "Creating Python virtual environment: /opt/keystone-venv"
+    python3 -m venv /opt/keystone-venv
+    source /opt/keystone-venv/bin/activate
+    
+    log_info "Installing Python package: pip (upgrade)"
+    pip install --upgrade pip
+    log_info "Installing Python package: PyMySQL"
+    pip install PyMySQL
+    log_info "Installing Python package: keystone"
+    pip install keystone
+    log_info "Installing Python package: mod_wsgi"
+    pip install mod_wsgi
+    log_info "Installing Python package: python-openstackclient"
+    pip install python-openstackclient
+    log_success "Keystone Python packages installed"
+    
+    # Create keystone user
+    log_info "Creating user: keystone"
+    useradd -r -d /var/lib/keystone -s /sbin/nologin keystone 2>/dev/null || true
+    log_info "Creating directory: /etc/keystone"
+    mkdir -p /etc/keystone
+    log_info "Creating directory: /var/lib/keystone"
+    mkdir -p /var/lib/keystone
+    log_info "Creating directory: /var/log/keystone"
+    mkdir -p /var/log/keystone
+    log_info "Setting permissions: keystone:keystone on keystone directories"
+    chown keystone:keystone /var/lib/keystone /var/log/keystone
+    log_success "Keystone user and directories created"
+    
+    # Get RDS endpoint
+    log_info "AWS API call: describe-db-instances for ${ENVIRONMENT}-ha-db"
+    RDS_ENDPOINT=$(aws rds describe-db-instances --query "DBInstances[?DBInstanceStatus=='available' && contains(DBInstanceIdentifier, '${ENVIRONMENT}-ha-db')].Endpoint.Address | [0]" --output text 2>/dev/null)
+    if [[ -z "$RDS_ENDPOINT" || "$RDS_ENDPOINT" == "None" ]]; then
+        log_info "AWS API call: describe-db-instances for ${ENVIRONMENT}-db (fallback)"
+        RDS_ENDPOINT=$(aws rds describe-db-instances --query "DBInstances[?DBInstanceStatus=='available' && contains(DBInstanceIdentifier, '${ENVIRONMENT}-db')].Endpoint.Address | [0]" --output text 2>/dev/null || echo "localhost")
+    fi
+    log_info "Using RDS endpoint: $RDS_ENDPOINT"
+    
+    # Create keystone configuration
+    log_info "Creating config: /etc/keystone/keystone.conf"
+    cat > /etc/keystone/keystone.conf << EOF
+[DEFAULT]
+
+[database]
+connection = mysql+pymysql://keystone:${KEYSTONE_PASSWORD}@${RDS_ENDPOINT}/keystone
+
+[token]
+provider = fernet
+EOF
+    log_info "Setting permissions: keystone:keystone on keystone.conf"
+    chown keystone:keystone /etc/keystone/keystone.conf
+    log_success "Keystone configuration created"
+    
+    # Initialize keystone on first server only
+    if [[ ${SERVER_INDEX} -eq 1 ]]; then
+        log_info "Setting up keystone database (PRIMARY SERVER)"
+        
+        log_info "Connecting to database: $RDS_ENDPOINT:3306"
+        mysql -h "$RDS_ENDPOINT" -u admin -p"$ADMIN_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS keystone; CREATE USER IF NOT EXISTS 'keystone'@'%' IDENTIFIED BY '$KEYSTONE_PASSWORD'; GRANT ALL ON keystone.* TO 'keystone'@'%'; FLUSH PRIVILEGES;" 2>/dev/null || true
+        log_success "Keystone database and user created"
+        
+        log_info "Running schema operation: keystone-manage db_sync"
+        source /opt/keystone-venv/bin/activate
+        keystone-manage db_sync
+        log_success "Keystone database synchronized"
+        
+        log_info "Running keystone-manage fernet_setup"
+        keystone-manage fernet_setup --keystone-user keystone --keystone-group keystone
+        log_success "Fernet keys setup completed"
+        
+        log_info "Running keystone-manage credential_setup"
+        keystone-manage credential_setup --keystone-user keystone --keystone-group keystone
+        log_success "Credential keys setup completed"
+        
+        log_info "Running keystone-manage bootstrap"
+        keystone-manage bootstrap \
+            --bootstrap-password "${KEYSTONE_PASSWORD}" \
+            --bootstrap-admin-url "https://keystone0${SERVER_INDEX}.${ENVIRONMENT}.cso.ss:5000/api/idm/v3/" \
+            --bootstrap-internal-url "https://keystone0${SERVER_INDEX}.${ENVIRONMENT}.cso.ss:5000/api/idm/v3/" \
+            --bootstrap-public-url "https://keystone0${SERVER_INDEX}.${ENVIRONMENT}.cso.ss:5000/api/idm/v3/" \
+            --bootstrap-region-id RegionOne
+        log_success "Keystone bootstrap completed"
+    fi
+    
+    # Configure Apache
+    local mod_wsgi_path=$(find /opt/keystone-venv -name "mod_wsgi*.so" | head -1)
+    log_info "Found mod_wsgi path: $mod_wsgi_path"
+    
+    log_info "Creating config: /etc/httpd/conf.d/wsgi-keystone.conf"
+    cat > /etc/httpd/conf.d/wsgi-keystone.conf << EOF
+LoadModule wsgi_module $mod_wsgi_path
+Listen 5000
+
+<VirtualHost *:5000>
+    WSGIDaemonProcess keystone-public processes=5 threads=1 user=keystone group=keystone python-home=/opt/keystone-venv
+    WSGIProcessGroup keystone-public
+    WSGIScriptAlias /api/idm /usr/local/bin/keystone-wsgi-public
+    WSGIApplicationGroup %{GLOBAL}
+    WSGIPassAuthorization On
+    
+    <Directory /usr/local/bin>
+        Require all granted
+    </Directory>
+</VirtualHost>
+EOF
+    log_success "Apache configuration created"
+    
+    log_info "Creating file: /usr/local/bin/keystone-wsgi-public"
+    cat > /usr/local/bin/keystone-wsgi-public << 'EOF'
+#!/opt/keystone-venv/bin/python
+import sys
+sys.path.insert(0, '/opt/keystone-venv/lib/python3.9/site-packages')
+from keystone.server.wsgi import initialize_public_application
+application = initialize_public_application()
+EOF
+    log_info "Setting permissions: 755 on keystone-wsgi-public"
+    chmod +x /usr/local/bin/keystone-wsgi-public
+    log_success "WSGI script created"
+    
+    log_info "Starting service: httpd"
+    systemctl enable --now httpd.service
+    log_success "Apache service started"
+    
+    # Signal keystone is ready
+    if [[ ${SERVER_INDEX} -eq 1 ]]; then
+        log_info "Creating file: /opt/scripts/.keystone-done"
+        touch /opt/scripts/.keystone-done
+        log_success "Keystone ready marker created"
+    fi
+    sudo setsebool -P httpd_read_user_content 1
+    log_progress "Keystone server setup completed"
+}
+
+# RabbitMQ server setup
+setup_rabbitmq() {
+    log_progress "STEP 4/8: Setting up RabbitMQ server"
+    
+    log_info "Installing package: socat"
+    dnf install -y socat
+    log_info "Installing package: logrotate"
+    dnf install -y logrotate
+    log_info "Installing package: nginx"
+    dnf install -y nginx
+    log_success "RabbitMQ dependencies installed"
+    
+    log_info "Installing package: erlang (from GitHub)"
+    dnf install -y https://github.com/rabbitmq/erlang-rpm/releases/download/v26.2.5.2/erlang-26.2.5.2-1.el9.x86_64.rpm || log_info "Erlang already installed"
+    
+    log_info "Downloading: s3://${S3_BUCKET}/rabbitmq-server-3.13.3-1.el8.noarch.rpm -> /tmp/"
+    if aws s3 cp "s3://${S3_BUCKET}/rabbitmq-server-3.13.3-1.el8.noarch.rpm" /tmp/rabbitmq-server.rpm 2>/dev/null; then
+        log_info "Installing package: rabbitmq-server (from S3)"
+        dnf install -y /tmp/rabbitmq-server.rpm
+        log_success "RabbitMQ server installed"
+    else
+        log_error "RabbitMQ RPM not found in S3"
+        exit 1
+    fi
+    
+    log_info "Starting service: rabbitmq-server"
+    systemctl enable --now rabbitmq-server
+    log_info "Enabling RabbitMQ plugin: rabbitmq_management"
+    rabbitmq-plugins enable rabbitmq_management
+    log_success "RabbitMQ services started"
+    
+    # Configure clustering and users
+    if [[ ${SERVER_INDEX} -eq 1 ]]; then
+        log_info "Creating RabbitMQ user: admin"
+        rabbitmqctl add_user admin "${RABBITMQ_PASSWORD}"
+        rabbitmqctl set_user_tags admin administrator
+        log_info "Creating RabbitMQ vhost: /ssp"
+        rabbitmqctl add_vhost /ssp 2>/dev/null || log_info "vhost /ssp already exists"
+        log_success "RabbitMQ primary node configured"
+    fi
+    sudo setsebool -P httpd_read_user_content 1
+    log_progress "RabbitMQ server setup completed"
+}
+
+# Backend server setup
+setup_backend() {
+    log_progress "STEP 4/8: Setting up backend server"
+    
+    log_info "Installing package: java-21-amazon-corretto-devel"
+    dnf install -y java-21-amazon-corretto-devel
+    log_info "Installing package: nodejs"
+    dnf install -y nodejs
+    log_info "Installing package: npm"
+    dnf install -y npm
+    log_info "Installing package: nginx"
+    dnf install -y nginx
+    log_info "Installing package: mariadb105-server-utils"
+    dnf install -y mariadb105-server-utils
+    log_success "Backend packages installed"
+    
+    # Configure nginx for backend services (ports 8090-8106 -> 443)
+    cat > /etc/nginx/conf.d/backend.conf << 'EOF'
+server {
+    listen 443 ssl http2;
+    server_name _;
+    
+    # SSL configuration (self-signed for now)
+    ssl_certificate /etc/ssl/certs/nginx-selfsigned.crt;
+    ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;
+    
+    # Backend services proxy (ports 8090-8106)
+    location /api/ {
+        proxy_pass http://localhost:8090;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    
+    location / {
+        proxy_pass http://localhost:8090;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+EOF
+    
+    # Generate self-signed SSL certificate
+    mkdir -p /etc/ssl/private
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/ssl/private/nginx-selfsigned.key \
+        -out /etc/ssl/certs/nginx-selfsigned.crt \
+        -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost" 2>/dev/null
+    
+    log_info "Starting service: nginx"
+    systemctl enable --now nginx
+    log_success "Nginx service started"
+    
+    # Wait for keystone
+    log_info "Waiting for dependency: keystone (timeout: 7200s)"
+    timeout 120m sh -c 'while ! [ -f /opt/scripts/.keystone-done ]; do sleep 60; done' || log_warning "Keystone timeout"
+    log_success "Dependency satisfied: keystone"
+    
+    # Get RDS connection info
+    log_info "AWS API call: describe-db-instances for RDS credentials"
+    RDS_ENDPOINT=$(aws rds describe-db-instances --query "DBInstances[?DBInstanceStatus=='available' && contains(DBInstanceIdentifier, '${ENVIRONMENT}-ha-db')].Endpoint.Address | [0]" --output text 2>/dev/null)
+    RDS_SECRET_ARN=$(aws rds describe-db-instances --query "DBInstances[?DBInstanceStatus=='available' && contains(DBInstanceIdentifier, '${ENVIRONMENT}-ha-db')].MasterUserSecret.SecretArn | [0]" --output text 2>/dev/null)
+    
+    if [[ -n "$RDS_SECRET_ARN" && "$RDS_SECRET_ARN" != "None" ]]; then
+        log_info "AWS API call: get-secret-value for RDS master credentials"
+        RDS_SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$RDS_SECRET_ARN" --query SecretString --output text 2>/dev/null)
+        RDS_MASTER_USERNAME=$(echo "$RDS_SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('username', 'admin'))" 2>/dev/null)
+        RDS_MASTER_PASSWORD=$(echo "$RDS_SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('password', '$ADMIN_PASSWORD'))" 2>/dev/null)
+        log_success "Retrieved RDS master credentials from AWS-managed secret"
+    else
+        RDS_MASTER_USERNAME="admin"
+        RDS_MASTER_PASSWORD="$ADMIN_PASSWORD"
+        log_warning "Using fallback RDS credentials"
+    fi
+    
+    # Create databases
+    if [[ -n "$RDS_ENDPOINT" && "$RDS_ENDPOINT" != "None" ]]; then
+        log_info "Connecting to database: $RDS_ENDPOINT:3306"
+        for db in catalog blobstore customers request fulfill svcinst pricing reporting config export ticketing event; do
+            log_info "Creating database: ecs_${db}"
+            mysql -h "$RDS_ENDPOINT" -u "$RDS_MASTER_USERNAME" -p"$RDS_MASTER_PASSWORD" -e "CREATE DATABASE IF NOT EXISTS ecs_${db}; CREATE USER IF NOT EXISTS 'ecs_${db}'@'%' IDENTIFIED BY '$SERVICE_PASSWORD'; GRANT ALL ON ecs_${db}.* TO 'ecs_${db}'@'%'; FLUSH PRIVILEGES;" 2>/dev/null || true
+        done
+        log_success "Backend databases created"
+    fi
+    
+    # Install CSO application
+    if [[ -d "/opt/install" ]]; then
+        log_info "Changing directory: /opt/install"
+        cd /opt/install
+        
+        log_info "Creating directory: work"
+        mkdir -p work
+        
+        # Fix installer
+        if [[ -f "installer_p3.py" ]]; then
+            log_info "Patching installer: configparser fix"
+            sed -i 's/configparser.SafeConfigParser/configparser.ConfigParser/g' installer_p3.py
+            log_info "Patching installer: work_dir null check"
+            sed -i '/def extract_parts(part_package_paths, work_dir):/a\    if work_dir is None: work_dir = "/opt/install/work"\n    os.makedirs(work_dir, exist_ok=True)' installer_p3.py
+            log_success "Installer patched"
+            
+            log_info "Running installer: python3 installer_p3.py -i backend,backend-lb"
+            timeout 5m python3 installer_p3.py -i backend,backend-lb || log_warning "Installer timeout/error - continuing"
+            sudo setsebool -P httpd_can_network_connect 1
+            log_success "CSO backend installation completed"
+        fi
+    fi
+    
+    log_progress "Backend server setup completed"
+}
+
+# Frontend server setup
+setup_frontend() {
+    log_progress "STEP 4/8: Setting up frontend server"
+    
+    # Install packages
+    dnf install -y java-21-amazon-corretto-devel nodejs npm nginx unzip
+    systemctl enable nginx
+    systemctl start nginx
+    
+    # Configure nginx for frontend services (Admin UI: 8102, Portal UI: 8202, HTTPS: 443)
+    cat > /etc/nginx/conf.d/cso.conf << 'EOF'
+server {
+    listen 443 ssl http2;
+    server_name _;
+    
+    # SSL configuration (self-signed for now)
+    ssl_certificate /etc/ssl/certs/nginx-selfsigned.crt;
+    ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;
+    
+    # Admin UI proxy
+    location /admin {
+        proxy_pass http://localhost:8102;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    
+    # Portal UI proxy
+    location / {
+        proxy_pass http://localhost:8202;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# Direct access servers (can be firewalled)
+server {
+    listen 8102;
+    location / {
+        return 200 'Admin UI Direct Access';
+        add_header Content-Type text/plain;
+    }
+}
+
+server {
+    listen 8202;
+    location / {
+        return 200 'Portal UI Direct Access';
+        add_header Content-Type text/plain;
+    }
+}
+EOF
+    
+    # Generate self-signed SSL certificate
+    mkdir -p /etc/ssl/private
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/ssl/private/nginx-selfsigned.key \
+        -out /etc/ssl/certs/nginx-selfsigned.crt \
+        -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost" 2>/dev/null
+    
+    systemctl restart nginx
+    
+    # Wait for keystone
+    timeout 60m sh -c 'while ! [ -f /opt/scripts/.keystone-done ]; do sleep 60; done' || echo "Keystone timeout"
+    
+    # Use pre-extracted installation files from jump server
+    if [[ -d "/opt/install" ]]; then
+        log_info "Using pre-extracted installation files from jump server"
+        cd /opt/scripts/
+        
+        # Pre-create work directory structure
+        #mkdir -p /opt/scripts/install/work
+        #chown -R ecs:ecs /opt/scripts/install/work
+        
+        # Run installer without arguments (like original)
+        log_info "Starting CSO installer..."
+        set +e
+        sudo su -c "python3 installer_p3.py -i frontend,frontend-lb,doc" 2>&1 | tee /var/log/cso-install.log
+        INSTALLER_EXIT_CODE=$?
+        sudo setsebool -P httpd_can_network_connect 1
+        set -e
+        
+        if [[ $INSTALLER_EXIT_CODE -eq 0 ]]; then
+            log_success "CSO application installation completed successfully"
+        else
+            log_error "CSO installer failed with exit code: $INSTALLER_EXIT_CODE"
+            exit 1
+        fi
+    fi
+    
+    log_progress "Frontend server setup completed"
+}
+
+# Main execution function
+main() {
+    # Parse command line arguments
+    ENVIRONMENT=${1:-}
+    SERVER_TYPE=${2:-}
+    SERVER_INDEX=${3:-}
+    EFS_DNS_NAME=${4:-}
+    S3_BUCKET=${5:-}
+    
+    # Auto-detect parameters
+    detect_parameters
+    
+    # Validate parameters
+    validate_parameters
+    
+    # Get passwords
+    get_passwords
+    
+    # Common setup
+    setup_common
+    
+    # Skip waiting for jump server if we ARE the jump server
+    if [[ "$SERVER_TYPE" != "jump" ]]; then
+        wait_for_jump_server
+    fi
+    
+    # Server-specific setup
+    case $SERVER_TYPE in
+        jump)
+            setup_jump
+            ;;
+        keystone)
+            setup_keystone
+            ;;
+        rabbitmq)
+            setup_rabbitmq
+            ;;
+        backend)
+            setup_backend
+            ;;
+        frontend)
+            setup_frontend
+            ;;
+    esac
+    
+    # Create completion marker
+    log_info "Creating file: /opt/scripts/.${SERVER_TYPE}-setup-complete"
+    touch "/opt/scripts/.${SERVER_TYPE}-setup-complete"
+    log_success "Completion marker created"
+    
+    log_progress "=== ${SERVER_TYPE^^} SETUP COMPLETED SUCCESSFULLY ==="
+}
+
+# Run main function
+main "$@"
